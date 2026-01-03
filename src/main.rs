@@ -3,6 +3,7 @@ mod components;
 mod config;
 mod app;
 mod localize;
+mod recommender;
 mod subscriptions;
 use tracing::info;
 
