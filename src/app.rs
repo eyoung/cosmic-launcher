@@ -184,7 +184,7 @@ pub enum Message {
     LauncherEvent(launcher::Event),
     Layer(LayerEvent),
     KeyboardNav(keyboard_nav::Action),
-    ActivationToken(Option<String>, String, String, GpuPreference, bool),
+    ActivationToken(Option<String>, String, String, String, GpuPreference, bool),
     AltTab,
     ShiftAltTab,
     Opened(Size, window::Id),
@@ -408,6 +408,9 @@ impl cosmic::Application for CosmicLauncher {
                             let Some(exec) = entry.exec else {
                                 return Task::none();
                             };
+                            let entry_id = entry.id.to_string();
+                            let is_terminal = entry.terminal;
+                            let desktop_path_clone = desktop_path.clone();
                             return request_token(
                                 Some(String::from(Self::APP_ID)),
                                 Some(self.window_id),
@@ -415,10 +418,11 @@ impl cosmic::Application for CosmicLauncher {
                             .map(move |token| {
                                 cosmic::Action::App(Message::ActivationToken(
                                     token,
-                                    entry.id.to_string(),
+                                    entry_id.clone(),
+                                    desktop_path_clone.clone(),
                                     exec.clone(),
                                     GpuPreference::Default,
-                                    entry.terminal,
+                                    is_terminal,
                                 ))
                             });
                         }
@@ -506,7 +510,7 @@ impl cosmic::Application for CosmicLauncher {
                         gpu_preference,
                         action_name,
                     } => {
-                        if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path) {
+                        if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path.clone()) {
                             let exec = if let Some(action_name) = action_name {
                                 entry
                                     .desktop_actions
@@ -520,6 +524,9 @@ impl cosmic::Application for CosmicLauncher {
                             let Some(exec) = exec else {
                                 return Task::none();
                             };
+                            let desktop_path = path.to_string_lossy().to_string();
+                            let entry_id = entry.id.to_string();
+                            let is_terminal = entry.terminal;
                             return request_token(
                                 Some(String::from(Self::APP_ID)),
                                 Some(self.window_id),
@@ -527,10 +534,11 @@ impl cosmic::Application for CosmicLauncher {
                             .map(move |token| {
                                 cosmic::Action::App(Message::ActivationToken(
                                     token,
-                                    entry.id.to_string(),
+                                    entry_id.clone(),
+                                    desktop_path.clone(),
                                     exec.clone(),
                                     gpu_preference,
-                                    entry.terminal,
+                                    is_terminal,
                                 ))
                             });
                         }
@@ -555,52 +563,30 @@ impl cosmic::Application for CosmicLauncher {
                             let mut recommendations = Vec::new();
                             self.recommended_desktop_paths.clear();
                             
-                            for app_id in recommended_apps.iter() {
-                                // Ensure app_id has .desktop extension
-                                let desktop_file = if app_id.ends_with(".desktop") {
-                                    app_id.clone()
-                                } else {
-                                    format!("{}.desktop", app_id)
-                                };
+                            for desktop_path in recommended_apps.iter() {
+                                let path = std::path::PathBuf::from(desktop_path);
                                 
-                                // Search for desktop file in standard locations
-                                let mut search_paths = vec![
-                                    std::path::PathBuf::from("/usr/share/applications").join(&desktop_file),
-                                    std::path::PathBuf::from("/usr/local/share/applications").join(&desktop_file),
-                                ];
-                                
-                                // Add user-specific directories
-                                if let Ok(home) = std::env::var("HOME") {
-                                    search_paths.push(std::path::PathBuf::from(home).join(".local/share/applications").join(&desktop_file));
-                                }
-                                
-                                let desktop_path = search_paths.iter().find(|p| p.exists());
-                                
-                                warn!("[RECOMMEND] Trying to load desktop file: {} -> {:?}", desktop_file, desktop_path);
+                                warn!("[RECOMMEND] Trying to load desktop file: {}", desktop_path);
                                 // Try to load the desktop file to get proper name and icon
-                                if let Some(path) = desktop_path {
-                                    if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path.clone()) {
-                                        warn!("[RECOMMEND] Successfully loaded desktop file: {} -> {}", desktop_file, entry.name);
-                                        // Use the app ID (without .desktop) for icon lookup
-                                        let icon_name = app_id.trim_end_matches(".desktop");
-                                        let icon = Some(IconSource::Name(std::borrow::Cow::Owned(icon_name.to_string())));
-                                        
-                                        // Store the desktop path for activation
-                                        self.recommended_desktop_paths.push(path.to_string_lossy().to_string());
-                                        
-                                        recommendations.push(SearchResult {
-                                            id: 0, // Will be handled specially
-                                            name: entry.name,
-                                            description: "Recommended".to_string(),
-                                            icon,
-                                            category_icon: Some(IconSource::Name(std::borrow::Cow::Borrowed("starred-symbolic"))),
-                                            window: None,
-                                        });
-                                    } else {
-                                        warn!("[RECOMMEND] Failed to load desktop file from path: {:?}", path);
-                                    }
+                                if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path.clone()) {
+                                    warn!("[RECOMMEND] Successfully loaded desktop file: {} -> {}", desktop_path, entry.name);
+                                    
+                                    // Use the entry ID for icon lookup
+                                    let icon = Some(IconSource::Name(std::borrow::Cow::Owned(entry.id.clone())));
+                                    
+                                    // Store the desktop path for activation
+                                    self.recommended_desktop_paths.push(desktop_path.clone());
+                                    
+                                    recommendations.push(SearchResult {
+                                        id: 0, // Will be handled specially
+                                        name: entry.name,
+                                        description: "Recommended".to_string(),
+                                        icon,
+                                        category_icon: Some(IconSource::Name(std::borrow::Cow::Borrowed("starred-symbolic"))),
+                                        window: None,
+                                    });
                                 } else {
-                                    warn!("[RECOMMEND] Desktop file not found: {}", desktop_file);
+                                    warn!("[RECOMMEND] Failed to load desktop file: {}", desktop_path);
                                 }
                             }
                             
@@ -750,8 +736,8 @@ impl cosmic::Application for CosmicLauncher {
                     _ => {}
                 };
             }
-            Message::ActivationToken(token, app_id, exec, dgpu, terminal) => {
-                self.recommender.record_launch(&app_id, std::time::SystemTime::now());
+            Message::ActivationToken(token, app_id, desktop_path, exec, dgpu, terminal) => {
+                self.recommender.record_launch(&desktop_path, std::time::SystemTime::now());
                 
                 return Task::perform(launch(token, app_id, exec, dgpu, terminal), |()| {
                     cosmic::action::app(Message::Hide)
