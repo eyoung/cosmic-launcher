@@ -24,6 +24,23 @@ mod tests {
         
         assert_eq!(recommendations, vec!["firefox"]);
     }
+
+    #[test]
+    fn returns_multiple_recommendations_sorted_by_frequency() {
+        let mut recommender = FrequencyBasedRecommender::default();
+        let now = SystemTime::now();
+        
+        recommender.record_launch("firefox", now);
+        recommender.record_launch("firefox", now);
+        recommender.record_launch("firefox", now);
+        recommender.record_launch("terminal", now);
+        recommender.record_launch("terminal", now);
+        recommender.record_launch("vscode", now);
+        
+        let recommendations = recommender.get_recommendations(3);
+        
+        assert_eq!(recommendations, vec!["firefox", "terminal", "vscode"]);
+    }
 }
 
 struct FrequencyBasedRecommender {
