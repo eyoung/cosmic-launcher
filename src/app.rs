@@ -58,7 +58,7 @@ use std::{
     time::Instant,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
@@ -166,6 +166,7 @@ pub struct CosmicLauncher {
     height: f32,
     needs_clear: bool,
     recommender: FrequencyBasedRecommender<SystemTimeProvider, FileStorage>,
+    recommended_desktop_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +354,7 @@ impl cosmic::Application for CosmicLauncher {
                     let storage = FileStorage::new(storage_path);
                     FrequencyBasedRecommender::new(SystemTimeProvider, storage)
                 },
+                recommended_desktop_paths: Vec::new(),
             },
             Task::none(),
         )
@@ -397,7 +399,31 @@ impl cosmic::Application for CosmicLauncher {
                 }
             }
             Message::Activate(i) => {
-                if let Some(item) = self.launcher_items.get(i.unwrap_or(self.focused)) {
+                let idx = i.unwrap_or(self.focused);
+                
+                // Check if this is a recommended item (ID 0 and within recommended range)
+                if idx < self.recommended_desktop_paths.len() {
+                    if let Some(desktop_path) = self.recommended_desktop_paths.get(idx) {
+                        if let Some(entry) = cosmic::desktop::load_desktop_file(&[], desktop_path.clone().into()) {
+                            let Some(exec) = entry.exec else {
+                                return Task::none();
+                            };
+                            return request_token(
+                                Some(String::from(Self::APP_ID)),
+                                Some(self.window_id),
+                            )
+                            .map(move |token| {
+                                cosmic::Action::App(Message::ActivationToken(
+                                    token,
+                                    entry.id.to_string(),
+                                    exec.clone(),
+                                    GpuPreference::Default,
+                                    entry.terminal,
+                                ))
+                            });
+                        }
+                    }
+                } else if let Some(item) = self.launcher_items.get(idx) {
                     self.request(launcher::Request::Activate(item.id));
                 } else {
                     return self.hide();
@@ -525,23 +551,67 @@ impl cosmic::Application for CosmicLauncher {
                         // Inject recommendations when input is empty and not alt-tab
                         if self.input_value.is_empty() && !self.alt_tab {
                             let recommended_apps = self.recommender.get_recommendations(3);
+                            warn!("[RECOMMEND] Got {} recommended apps: {:?}", recommended_apps.len(), recommended_apps);
                             let mut recommendations = Vec::new();
+                            self.recommended_desktop_paths.clear();
                             
-                            for (idx, app_id) in recommended_apps.iter().enumerate() {
-                                // Create simple search result from app_id
-                                recommendations.push(SearchResult {
-                                    id: (1000 + idx) as u32, // Use high IDs to avoid conflicts
-                                    name: format!("⭐ {}", app_id.trim_end_matches(".desktop")),
-                                    description: "Recommended".to_string(),
-                                    icon: Some(IconSource::Name(std::borrow::Cow::Borrowed("starred"))),
-                                    category_icon: None,
-                                    window: None,
-                                });
+                            for app_id in recommended_apps.iter() {
+                                // Ensure app_id has .desktop extension
+                                let desktop_file = if app_id.ends_with(".desktop") {
+                                    app_id.clone()
+                                } else {
+                                    format!("{}.desktop", app_id)
+                                };
+                                
+                                // Search for desktop file in standard locations
+                                let mut search_paths = vec![
+                                    std::path::PathBuf::from("/usr/share/applications").join(&desktop_file),
+                                    std::path::PathBuf::from("/usr/local/share/applications").join(&desktop_file),
+                                ];
+                                
+                                // Add user-specific directories
+                                if let Ok(home) = std::env::var("HOME") {
+                                    search_paths.push(std::path::PathBuf::from(home).join(".local/share/applications").join(&desktop_file));
+                                }
+                                
+                                let desktop_path = search_paths.iter().find(|p| p.exists());
+                                
+                                warn!("[RECOMMEND] Trying to load desktop file: {} -> {:?}", desktop_file, desktop_path);
+                                // Try to load the desktop file to get proper name and icon
+                                if let Some(path) = desktop_path {
+                                    if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path.clone()) {
+                                        warn!("[RECOMMEND] Successfully loaded desktop file: {} -> {}", desktop_file, entry.name);
+                                        // Use the app ID (without .desktop) for icon lookup
+                                        let icon_name = app_id.trim_end_matches(".desktop");
+                                        let icon = Some(IconSource::Name(std::borrow::Cow::Owned(icon_name.to_string())));
+                                        
+                                        // Store the desktop path for activation
+                                        self.recommended_desktop_paths.push(path.to_string_lossy().to_string());
+                                        
+                                        recommendations.push(SearchResult {
+                                            id: 0, // Will be handled specially
+                                            name: entry.name,
+                                            description: "Recommended".to_string(),
+                                            icon,
+                                            category_icon: Some(IconSource::Name(std::borrow::Cow::Borrowed("starred-symbolic"))),
+                                            window: None,
+                                        });
+                                    } else {
+                                        warn!("[RECOMMEND] Failed to load desktop file from path: {:?}", path);
+                                    }
+                                } else {
+                                    warn!("[RECOMMEND] Desktop file not found: {}", desktop_file);
+                                }
                             }
                             
+                            warn!("[RECOMMEND] Created {} recommendation items", recommendations.len());
                             // Prepend recommendations to the list
                             recommendations.extend(list);
                             list = recommendations;
+                            warn!("[RECOMMEND] Final list has {} items", list.len());
+                        } else {
+                            // Clear recommended paths when user is typing
+                            self.recommended_desktop_paths.clear();
                         }
                         
                         self.launcher_items.splice(.., list);
