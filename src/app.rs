@@ -1,4 +1,10 @@
-use crate::{app::iced::event::listen_raw, components, fl, subscriptions::launcher};
+use crate::{
+    app::iced::event::listen_raw, 
+    components, 
+    fl, 
+    recommender::{FileStorage, FrequencyBasedRecommender, Recommender, SystemTimeProvider},
+    subscriptions::launcher,
+};
 use clap::Parser;
 use cosmic::app::{Core, CosmicFlags, Settings, Task};
 use cosmic::cctk::sctk;
@@ -140,7 +146,6 @@ pub enum SurfaceState {
     WaitingToBeShown,
 }
 
-#[derive(Clone)]
 pub struct CosmicLauncher {
     core: Core,
     input_value: String,
@@ -160,6 +165,7 @@ pub struct CosmicLauncher {
     margin: f32,
     height: f32,
     needs_clear: bool,
+    recommender: FrequencyBasedRecommender<SystemTimeProvider, FileStorage>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +276,7 @@ impl CosmicLauncher {
             self.margin = o.y + o.height;
         }
     }
+
 }
 
 async fn launch(
@@ -336,6 +343,16 @@ impl cosmic::Application for CosmicLauncher {
                 overlap: HashMap::new(),
                 height: 100.,
                 needs_clear: false,
+                recommender: {
+                    let data_dir = std::env::var("XDG_STATE_HOME")
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".local/state")))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+                    let storage_path = data_dir.join("cosmic-launcher/usage.json");
+                    let storage = FileStorage::new(storage_path);
+                    FrequencyBasedRecommender::new(SystemTimeProvider, storage)
+                },
             },
             Task::none(),
         )
@@ -504,6 +521,29 @@ impl cosmic::Application for CosmicLauncher {
                             let b = i32::from(b.window.is_none());
                             a.cmp(&b)
                         });
+                        
+                        // Inject recommendations when input is empty and not alt-tab
+                        if self.input_value.is_empty() && !self.alt_tab {
+                            let recommended_apps = self.recommender.get_recommendations(3);
+                            let mut recommendations = Vec::new();
+                            
+                            for (idx, app_id) in recommended_apps.iter().enumerate() {
+                                // Create simple search result from app_id
+                                recommendations.push(SearchResult {
+                                    id: (1000 + idx) as u32, // Use high IDs to avoid conflicts
+                                    name: format!("⭐ {}", app_id.trim_end_matches(".desktop")),
+                                    description: "Recommended".to_string(),
+                                    icon: Some(IconSource::Name(std::borrow::Cow::Borrowed("starred"))),
+                                    category_icon: None,
+                                    window: None,
+                                });
+                            }
+                            
+                            // Prepend recommendations to the list
+                            recommendations.extend(list);
+                            list = recommendations;
+                        }
+                        
                         self.launcher_items.splice(.., list);
                         if self.result_ids.len() < self.launcher_items.len() {
                             self.result_ids.extend(
@@ -641,6 +681,8 @@ impl cosmic::Application for CosmicLauncher {
                 };
             }
             Message::ActivationToken(token, app_id, exec, dgpu, terminal) => {
+                self.recommender.record_launch(&app_id, std::time::SystemTime::now());
+                
                 return Task::perform(launch(token, app_id, exec, dgpu, terminal), |()| {
                     cosmic::action::app(Message::Hide)
                 });
